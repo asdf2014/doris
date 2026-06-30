@@ -16,9 +16,6 @@
 // under the License.
 
 suite("bucket_shuffle_set_operation") {
-    // TODO: open comment when support `enable_local_shuffle_planner` and change to REQUIRE
-    return
-
     multi_sql """
         drop table if exists bucket_shuffle_set_operation1;
         create table bucket_shuffle_set_operation1(id int, value int) distributed by hash(id) buckets 10 properties('replication_num'='1');
@@ -37,6 +34,9 @@ suite("bucket_shuffle_set_operation") {
 
     // make bucket shuffle set operation stable
     sql "set parallel_pipeline_task_num=5"
+    // disable the bucket shuffle downgrade so the chosen shapes do not depend on the
+    // backend count / parallelism of the environment running this suite
+    sql "set bucket_shuffle_downgrade_ratio=0"
 
     def checkShapeAndResult = { String tag, String sqlStr ->
         quickTest(tag + "_shape", "explain shape plan " + sqlStr)
@@ -94,6 +94,61 @@ suite("bucket_shuffle_set_operation") {
         except
         select id from bucket_shuffle_set_operation2 where id=1
         """)
+
+    // The basic child of a bucket-shuffle set operation can be a join output instead of a
+    // direct scan. In that shape the local exchange planned for the basic side must still
+    // partition by the storage bucket function: an execution-hash local exchange would not
+    // align with the bucket-distributed side and the set operation would compute wrong results.
+    checkShapeAndResult("bucket_shuffle_join_as_basic_child", """
+        select a.id from bucket_shuffle_set_operation1 a
+        join bucket_shuffle_set_operation2 b on a.id = b.id
+        intersect
+        select id from bucket_shuffle_set_operation3""")
+
+    // a set operation child can itself be a set operation whose output claims a bucket
+    // distribution; the outer set operation must only treat its children as bucket-aligned
+    // when they share the same storage layout
+    checkShapeAndResult("bucket_shuffle_nested_set_operation", """
+        select id from bucket_shuffle_set_operation3
+        union all
+        (select a.id from bucket_shuffle_set_operation1 a
+        join bucket_shuffle_set_operation2 b on a.id = b.id
+        intersect
+        select id from bucket_shuffle_set_operation2)""")
+
+    // when local shuffle is disabled entirely, every pipeline runs a single task per
+    // instance so the bucket alignment holds naturally and bucket shuffle is still allowed
+    sql "set enable_local_shuffle=false"
+    checkShapeAndResult("bucket_shuffle_when_local_shuffle_off", """
+        select id from bucket_shuffle_set_operation1
+        intersect
+        select id from bucket_shuffle_set_operation2""")
+    sql "set enable_local_shuffle=true"
+
+    // A shuffle join above the union pushes a hash request into the union
+    // (createHashRequestAccordingToParent, the parent-hash request path). When the FE does not
+    // plan the local shuffle, that request must be downgraded so the union does not choose
+    // bucket shuffle, while the result stays correct.
+    def unionParentHashSql = """
+        select b.id from (
+            select id from bucket_shuffle_set_operation1
+            union all
+            select id from bucket_shuffle_set_operation2
+        ) u join[shuffle] bucket_shuffle_set_operation3 b on u.id = b.id
+        """
+    sql "set enable_local_shuffle_planner=false"
+    explain {
+        sql "shape plan " + unionParentHashSql
+        check { String e ->
+            def unionIndex = e.indexOf("PhysicalUnion")
+            assertTrue(unionIndex >= 0)
+            // the union must not be a bucket shuffle union when the FE local shuffle planner is off
+            assertFalse(e.substring(unionIndex,
+                    Math.min(unionIndex + "PhysicalUnion".length() + 20, e.length())).contains("bucketShuffle"))
+        }
+    }
+    order_qt_union_parent_hash_when_local_shuffle_planner_off unionParentHashSql
+    sql "set enable_local_shuffle_planner=true"
 
     explain {
         sql """

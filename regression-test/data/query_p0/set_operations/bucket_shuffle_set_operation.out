@@ -117,3 +117,69 @@ PhysicalResultSink
 2
 3
 
+-- !bucket_shuffle_join_as_basic_child_shape --
+PhysicalResultSink
+--PhysicalIntersect[bucketShuffle]
+----PhysicalProject
+------hashJoin[INNER_JOIN broadcast] hashCondition=((a.id = b.id)) otherCondition=()
+--------PhysicalProject
+----------PhysicalOlapScan[bucket_shuffle_set_operation1(a)]
+--------PhysicalProject
+----------PhysicalOlapScan[bucket_shuffle_set_operation2(b)]
+----PhysicalDistribute[DistributionSpecHash]
+------PhysicalProject
+--------PhysicalOlapScan[bucket_shuffle_set_operation3]
+
+-- !bucket_shuffle_join_as_basic_child_result --
+1
+2
+3
+
+-- !bucket_shuffle_nested_set_operation_shape --
+PhysicalResultSink
+--PhysicalUnion
+----PhysicalDistribute[DistributionSpecExecutionAny]
+------PhysicalProject
+--------PhysicalOlapScan[bucket_shuffle_set_operation3]
+----PhysicalDistribute[DistributionSpecExecutionAny]
+------PhysicalIntersect[bucketShuffle]
+--------PhysicalProject
+----------hashJoin[INNER_JOIN broadcast] hashCondition=((a.id = b.id)) otherCondition=()
+------------PhysicalProject
+--------------PhysicalOlapScan[bucket_shuffle_set_operation1(a)]
+------------PhysicalProject
+--------------PhysicalOlapScan[bucket_shuffle_set_operation2(b)]
+--------PhysicalDistribute[DistributionSpecHash]
+----------PhysicalProject
+------------PhysicalOlapScan[bucket_shuffle_set_operation2]
+
+-- !bucket_shuffle_nested_set_operation_result --
+1
+1
+2
+2
+3
+3
+
+-- !bucket_shuffle_when_local_shuffle_off_shape --
+PhysicalResultSink
+--PhysicalIntersect[bucketShuffle]
+----PhysicalProject
+------PhysicalOlapScan[bucket_shuffle_set_operation1]
+----PhysicalDistribute[DistributionSpecHash]
+------PhysicalProject
+--------PhysicalOlapScan[bucket_shuffle_set_operation2]
+
+-- !bucket_shuffle_when_local_shuffle_off_result --
+1
+2
+3
+
+-- !union_parent_hash_when_local_shuffle_planner_off --
+1
+1
+2
+2
+3
+3
+
