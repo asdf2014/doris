@@ -35,12 +35,8 @@ import org.apache.doris.datasource.ExternalUtil;
 import org.apache.doris.datasource.FileQueryScanNode;
 import org.apache.doris.datasource.TableFormatType;
 import org.apache.doris.datasource.credentials.CredentialUtils;
-import org.apache.doris.datasource.credentials.VendedCredentialsFactory;
 import org.apache.doris.datasource.hive.HMSExternalTable;
-import org.apache.doris.datasource.iceberg.IcebergExternalCatalog;
 import org.apache.doris.datasource.iceberg.IcebergExternalMetaCache;
-import org.apache.doris.datasource.iceberg.IcebergExternalTable;
-import org.apache.doris.datasource.iceberg.IcebergSysExternalTable;
 import org.apache.doris.datasource.iceberg.IcebergUtils;
 import org.apache.doris.datasource.iceberg.cache.IcebergManifestCacheLoader;
 import org.apache.doris.datasource.iceberg.cache.ManifestCacheValue;
@@ -98,7 +94,6 @@ import org.apache.iceberg.mapping.MappedFields;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.util.ScanTaskUtil;
-import org.apache.iceberg.util.SerializationUtil;
 import org.apache.iceberg.util.TableScanUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -161,11 +156,6 @@ public class IcebergScanNode extends FileQueryScanNode {
     private String cachedFsIdentifier;
 
     private Boolean isBatchMode = null;
-    private boolean isSystemTable = false;
-
-    // ReferencedDataFile path -> List<DeleteFile> / List<TIcebergDeleteFileDesc> (exclude equal delete)
-    public Map<String, List<DeleteFile>> deleteFilesByReferencedDataFile = new HashMap<>();
-    public Map<String, List<TIcebergDeleteFileDesc>> deleteFilesDescByReferencedDataFile = new HashMap<>();
 
     // for test
     @VisibleForTesting
@@ -186,27 +176,6 @@ public class IcebergScanNode extends FileQueryScanNode {
         ExternalTable table = (ExternalTable) desc.getTable();
         if (table instanceof HMSExternalTable) {
             source = new IcebergHMSSource((HMSExternalTable) table, desc);
-        } else if (table instanceof IcebergExternalTable || table instanceof IcebergSysExternalTable) {
-            if (table instanceof IcebergSysExternalTable) {
-                isSystemTable = true;
-            }
-            String catalogType = table instanceof IcebergExternalTable
-                    ? ((IcebergExternalTable) table).getIcebergCatalogType()
-                    : ((IcebergSysExternalTable) table).getSourceTable().getIcebergCatalogType();
-            switch (catalogType) {
-                case IcebergExternalCatalog.ICEBERG_HMS:
-                case IcebergExternalCatalog.ICEBERG_REST:
-                case IcebergExternalCatalog.ICEBERG_DLF:
-                case IcebergExternalCatalog.ICEBERG_GLUE:
-                case IcebergExternalCatalog.ICEBERG_HADOOP:
-                case IcebergExternalCatalog.ICEBERG_JDBC:
-                case IcebergExternalCatalog.ICEBERG_S3_TABLES:
-                    source = new IcebergApiSource(table, desc, columnNameToRange);
-                    break;
-                default:
-                    Preconditions.checkState(false, "Unknown iceberg catalog type: " + catalogType);
-                    break;
-            }
         }
         Preconditions.checkNotNull(source);
     }
@@ -227,11 +196,11 @@ public class IcebergScanNode extends FileQueryScanNode {
                 formatVersion = MIN_DELETE_FILE_SUPPORT_VERSION;
             }
             preExecutionAuthenticator = source.getCatalog().getExecutionAuthenticator();
-            storagePropertiesMap = VendedCredentialsFactory.getStoragePropertiesMapWithVendedCredentials(
-                    source.getCatalog().getCatalogProperty().getMetastoreProperties(),
-                    source.getCatalog().getCatalogProperty().getStoragePropertiesMap(),
-                    icebergTable
-            );
+            // S4: HMS-iceberg has an HMS-typed metastore, so the former VendedCredentialsFactory dispatch
+            // always returned the base static map verbatim (only an ICEBERG-typed metastore had a vended
+            // provider, and those are plugin catalogs on the PluginDrivenScanNode path). Read the static map
+            // directly — byte-identical for this legacy HMS-iceberg path.
+            storagePropertiesMap = source.getCatalog().getCatalogProperty().getStoragePropertiesMap();
             backendStorageProperties = CredentialUtils.getBackendPropertiesFromStorageMap(storagePropertiesMap);
         } finally {
             if (getSummaryProfile() != null) {
@@ -286,14 +255,6 @@ public class IcebergScanNode extends FileQueryScanNode {
         TTableFormatFileDesc tableFormatFileDesc = new TTableFormatFileDesc();
         tableFormatFileDesc.setTableFormatType(icebergSplit.getTableFormatType().value());
         TIcebergFileDesc fileDesc = new TIcebergFileDesc();
-        if (isSystemTable) {
-            rangeDesc.setFormatType(TFileFormatType.FORMAT_JNI);
-            tableFormatFileDesc.setTableLevelRowCount(-1);
-            fileDesc.setSerializedSplit(icebergSplit.getSerializedSplit());
-            tableFormatFileDesc.setIcebergParams(fileDesc);
-            rangeDesc.setTableFormatParams(tableFormatFileDesc);
-            return;
-        }
         if (tableLevelPushDownCount) {
             tableFormatFileDesc.setTableLevelRowCount(icebergSplit.getTableLevelRowCount());
         } else {
@@ -349,22 +310,6 @@ public class IcebergScanNode extends FileQueryScanNode {
                 }
                 fileDesc.addToDeleteFiles(deleteFileDesc);
             }
-
-            // Filter out equality delete files from deleteFilesByReferencedDataFile as well.
-            List<DeleteFile> nonEqualityDeleteFiles = new ArrayList<>();
-            for (DeleteFile df : icebergSplit.getDeleteFiles()) {
-                if (df.content() != FileContent.EQUALITY_DELETES) {
-                    nonEqualityDeleteFiles.add(df);
-                }
-            }
-            deleteFilesByReferencedDataFile.put(icebergSplit.getOriginalPath(), nonEqualityDeleteFiles);
-            List<TIcebergDeleteFileDesc> nonEqualityDeleteFileDesc = new ArrayList<>();
-            for (TIcebergDeleteFileDesc df : fileDesc.getDeleteFiles()) {
-                if (df.getContent() != EqualityDelete.type()) {
-                    nonEqualityDeleteFileDesc.add(df);
-                }
-            }
-            deleteFilesDescByReferencedDataFile.put(icebergSplit.getOriginalPath(), nonEqualityDeleteFileDesc);
         }
         tableFormatFileDesc.setIcebergParams(fileDesc);
         rangeDesc.unsetColumnsFromPath();
@@ -483,25 +428,6 @@ public class IcebergScanNode extends FileQueryScanNode {
                 throw new RuntimeException(ExceptionUtils.getRootCauseMessage(e), e);
             }
         }
-    }
-
-    /**
-     * Get FileScanTasks from StatementContext for rewrite operations.
-     * This allows setting file scan tasks before the plan is generated.
-     */
-    private List<FileScanTask> getFileScanTasksFromContext() {
-        ConnectContext ctx = ConnectContext.get();
-        Preconditions.checkNotNull(ctx);
-        Preconditions.checkNotNull(ctx.getStatementContext());
-
-        // Get the rewrite file scan tasks from statement context
-        List<FileScanTask> tasks = ctx.getStatementContext().getAndClearIcebergRewriteFileScanTasks();
-        if (tasks != null && !tasks.isEmpty()) {
-            LOG.info("Retrieved {} file scan tasks from context for table {}",
-                    tasks.size(), icebergTable.name());
-            return new ArrayList<>(tasks);
-        }
-        return null;
     }
 
     @Override
@@ -896,14 +822,6 @@ public class IcebergScanNode extends FileQueryScanNode {
         return split;
     }
 
-    private Split createIcebergSysSplit(FileScanTask fileScanTask) {
-        long rowCount = fileScanTask.file() == null ? 1 : fileScanTask.file().recordCount();
-        IcebergSplit split = IcebergSplit.newSysTableSplit(
-                SerializationUtil.serializeToBase64(fileScanTask), rowCount);
-        split.setTableFormatType(TableFormatType.ICEBERG);
-        return split;
-    }
-
     @Override
     protected TColumnCategory classifyColumn(SlotDescriptor slot, List<String> partitionKeys) {
         if (Column.ICEBERG_ROWID_COL.equalsIgnoreCase(slot.getColumn().getName())) {
@@ -919,22 +837,7 @@ public class IcebergScanNode extends FileQueryScanNode {
     }
 
     private List<Split> doGetSplits(int numBackends) throws UserException {
-        if (isSystemTable) {
-            return doGetSystemTableSplits();
-        }
-
         List<Split> splits = new ArrayList<>();
-
-        // Use custom file scan tasks if available (for rewrite operations)
-        List<FileScanTask> customFileScanTasks = getFileScanTasksFromContext();
-        if (customFileScanTasks != null) {
-            for (FileScanTask task : customFileScanTasks) {
-                splits.add(createIcebergSplit(task));
-            }
-            selectedPartitionNum = partitionMapInfos.size();
-            recordManifestCacheProfile();
-            return splits;
-        }
 
         // Normal table scan planning
         TableScan scan = createTableScan();
@@ -971,29 +874,8 @@ public class IcebergScanNode extends FileQueryScanNode {
         return splits;
     }
 
-    private List<Split> doGetSystemTableSplits() throws UserException {
-        List<Split> splits = new ArrayList<>();
-        TableScan scan = createTableScan();
-        long startTime = System.currentTimeMillis();
-        try (CloseableIterable<FileScanTask> fileScanTasks = scan.planFiles()) {
-            fileScanTasks.forEach(task -> splits.add(createIcebergSysSplit(task)));
-        } catch (IOException e) {
-            throw new UserException(e.getMessage(), e);
-        } finally {
-            if (getSummaryProfile() != null) {
-                getSummaryProfile().addExternalTableGetFileScanTasksTime(System.currentTimeMillis() - startTime);
-            }
-        }
-        selectedPartitionNum = 0;
-        return splits;
-    }
-
     @Override
     public boolean isBatchMode() {
-        if (isSystemTable) {
-            isBatchMode = false;
-            return false;
-        }
         Boolean cached = isBatchMode;
         if (cached != null) {
             return cached;
@@ -1087,9 +969,6 @@ public class IcebergScanNode extends FileQueryScanNode {
 
     @Override
     public TFileFormatType getFileFormatType() throws UserException {
-        if (isSystemTable) {
-            return TFileFormatType.FORMAT_JNI;
-        }
         TFileFormatType type;
         String icebergFormat = source.getFileFormat();
         if (icebergFormat.equalsIgnoreCase("parquet")) {
