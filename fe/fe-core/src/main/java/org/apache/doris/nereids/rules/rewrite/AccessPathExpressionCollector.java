@@ -214,6 +214,7 @@ public class AccessPathExpressionCollector extends DefaultExpressionVisitor<Void
             CollectorContext offsetContext =
                     new CollectorContext(context.statementContext, context.bottomFilter);
             offsetContext.accessPathBuilder.addSuffix(AccessPathInfo.ACCESS_OFFSET);
+            offsetContext.setType(ColumnAccessPathType.META);
             return arg.accept(this, offsetContext);
         }
         // fall through to default (recurse into children with fresh contexts)
@@ -232,6 +233,7 @@ public class AccessPathExpressionCollector extends DefaultExpressionVisitor<Void
             CollectorContext offsetContext =
                     new CollectorContext(context.statementContext, context.bottomFilter);
             offsetContext.accessPathBuilder.addSuffix(AccessPathInfo.ACCESS_OFFSET);
+            offsetContext.setType(ColumnAccessPathType.META);
             return arg.accept(this, offsetContext);
         }
         return visit(mapSize, context);
@@ -251,6 +253,7 @@ public class AccessPathExpressionCollector extends DefaultExpressionVisitor<Void
             CollectorContext offsetContext =
                     new CollectorContext(context.statementContext, context.bottomFilter);
             offsetContext.accessPathBuilder.addSuffix(AccessPathInfo.ACCESS_OFFSET);
+            offsetContext.setType(ColumnAccessPathType.META);
             // cardinality(map_keys(m)) == cardinality(m) == cardinality(map_values(m)):
             // all three count map entries, so emit the same [map_col, OFFSET] path.
             Expression effectiveArg = (arg instanceof MapKeys || arg instanceof MapValues)
@@ -642,6 +645,7 @@ public class AccessPathExpressionCollector extends DefaultExpressionVisitor<Void
             CollectorContext nullContext =
                     new CollectorContext(context.statementContext, context.bottomFilter);
             nullContext.accessPathBuilder.addSuffix(AccessPathInfo.ACCESS_NULL);
+            nullContext.setType(ColumnAccessPathType.META);
             return continueCollectAccessPath(arg, nullContext);
         }
         return visit(isNull, context);

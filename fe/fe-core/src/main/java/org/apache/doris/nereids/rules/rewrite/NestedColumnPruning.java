@@ -231,7 +231,7 @@ public class NestedColumnPruning implements CustomRewriter {
             Slot slot = kv.getKey();
             List<CollectAccessPathResult> collectAccessPathResults = kv.getValue();
             boolean hasRegularAccessPath = collectAccessPathResults.stream()
-                    .anyMatch(resultItem -> !isDataSkippingOnlyAccessPath(resultItem.getPath()));
+                    .anyMatch(resultItem -> resultItem.getType() != ColumnAccessPathType.META);
             if (slot.getDataType() instanceof VariantType) {
                 variantSlots.put(slot, slot.getDataType());
                 for (CollectAccessPathResult collectAccessPathResult : collectAccessPathResults) {
@@ -343,7 +343,7 @@ public class NestedColumnPruning implements CustomRewriter {
         List<String> path = accessPathResult.getPath();
         ColumnAccessPathType pathType = accessPathResult.getType();
         if (accessPathResult.isPredicate() && hasRegularAccessPath
-                && isDataSkippingOnlyAccessPath(path)) {
+                && pathType == ColumnAccessPathType.META) {
             if (hasMapStarAccessPath(slot, path)) {
                 // Keep map-star metadata until expandMapStarPaths() turns it into precise
                 // KEYS/VALUES paths. Stripping here would broaden map value reads to map.*.
@@ -404,16 +404,7 @@ public class NestedColumnPruning implements CustomRewriter {
     }
 
     private static boolean isMetaPath(ColumnAccessPath path) {
-        return isDataSkippingOnlyAccessPath(path.getPath());
-    }
-
-    private static boolean isDataSkippingOnlyAccessPath(List<String> components) {
-        if (components.isEmpty()) {
-            return false;
-        }
-        String lastComponent = components.get(components.size() - 1);
-        return AccessPathInfo.ACCESS_NULL.equals(lastComponent)
-                || AccessPathInfo.ACCESS_OFFSET.equals(lastComponent);
+        return path.getType() == ColumnAccessPathType.META;
     }
 
     private static List<String> stripDataSkippingSuffix(List<String> components) {
